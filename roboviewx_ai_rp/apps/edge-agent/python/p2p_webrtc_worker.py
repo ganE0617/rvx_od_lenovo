@@ -300,11 +300,11 @@ class P2PWorker:
             if getattr(channel, "label", "") == "ai":
                 ai_dc = channel
 
-        # Create 'ai' channel proactively (viewer may also create one; we accept either).
-        try:
-            ai_dc = pc.createDataChannel("ai")
-        except Exception:
-            ai_dc = None
+        # DataChannel negotiation:
+        # The browser (offerer) must create the DataChannel before createOffer()
+        # so the SDP includes m=application. Therefore we primarily *accept* the
+        # channel via pc.on("datachannel") and do not rely on creating it here.
+        ai_dc = None
 
         # Create camera track
         src = os.environ.get("EDGE_VIDEO_SOURCE") or "v4l2:/dev/video0"

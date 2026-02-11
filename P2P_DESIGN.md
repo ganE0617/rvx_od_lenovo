@@ -72,6 +72,10 @@ Node writes to worker stdin:
 
 **Channel label**: `ai`
 
+**Negotiation note**:
+- The **browser (offerer)** must create the DataChannel (`pc.createDataChannel("ai")`) **before** `createOffer()`,
+  otherwise the SDP offer won't include `m=application` and the worker cannot negotiate the channel in its answer.
+
 **Payload**: `detection_v1` JSON string:
 ```json
 {

@@ -102,6 +102,19 @@ export class P2PViewer {
             const pc = new RTCPeerConnection({ iceServers });
             this.pc = pc;
 
+            // IMPORTANT: Create the 'ai' DataChannel BEFORE createOffer().
+            // Otherwise the SDP offer won't include m=application and the worker
+            // cannot negotiate a DataChannel in the answer.
+            try {
+                const aiDc = pc.createDataChannel('ai');
+                this.aiDataChannel = aiDc;
+                this._wireAiChannel(aiDc);
+                aiDc.onopen = () => console.log('[P2P] ai DataChannel open');
+                aiDc.onclose = () => console.log('[P2P] ai DataChannel close');
+            } catch (e) {
+                console.warn('[P2P] failed to create ai DataChannel', e);
+            }
+
             pc.oniceconnectionstatechange = () => {
                 console.log('[P2P] iceConnectionState=', pc.iceConnectionState);
             };
