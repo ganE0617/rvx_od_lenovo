@@ -98,22 +98,23 @@ export class TiltController {
     return Math.max(0, Math.min(1, v));
   }
 
-  private deriveUnitPerDegFromDriver(opts: {
-    rawMin: number;
-    rawMax: number;
-    logicalMinDeg: number;
-    logicalMaxDeg: number;
-    fallback: number;
-  }): number {
-    if (this.unitPerDegExplicit) return opts.fallback || 3600;
-    const logicalExtent = Math.max(Math.abs(opts.logicalMinDeg), Math.abs(opts.logicalMaxDeg));
-    const rawExtent = Math.max(Math.abs(opts.rawMin), Math.abs(opts.rawMax));
-    if (!isFinite(logicalExtent) || logicalExtent <= 0) return opts.fallback || 3600;
-    if (!isFinite(rawExtent) || rawExtent <= 0) return opts.fallback || 3600;
-    const derived = rawExtent / logicalExtent;
-    // Guardrail: if derived is absurdly small/large, fall back.
-    if (!isFinite(derived) || derived < 1 || derived > 10_000_000) return opts.fallback || 3600;
-    return derived;
+  /**
+   * UVC pan/tilt absolute controls are commonly expressed in units of 1/3600 degree.
+   * Many devices explicitly report `step=3600` for *_absolute, which is the most reliable
+   * way to derive the unit scale. Avoid inferring from min/max because some drivers
+   * can report inconsistent logical ranges.
+   */
+  private unitPerDegFor(info: { step: number }): number {
+    if (this.unitPerDegExplicit && isFinite(this.unitPerDeg) && this.unitPerDeg > 0) {
+      return this.unitPerDeg;
+    }
+    const s = Number(info.step);
+    if (isFinite(s) && s > 0) return Math.abs(s);
+    return isFinite(this.unitPerDeg) && this.unitPerDeg > 0 ? this.unitPerDeg : 3600;
+  }
+
+  private clamp(v: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, v));
   }
 
   private intersectRange(a: { min: number; max: number }, b: { min: number; max: number }): {
@@ -152,25 +153,23 @@ export class TiltController {
       }),
     ]);
 
-    const fallbackUnit = this.unitPerDeg || 3600;
-    const unitPan = this.deriveUnitPerDegFromDriver({
-      rawMin: panInfo.min,
-      rawMax: panInfo.max,
-      logicalMinDeg: this.MIN_PAN,
-      logicalMaxDeg: this.MAX_PAN,
-      fallback: fallbackUnit,
-    });
-    const unitTilt = this.deriveUnitPerDegFromDriver({
-      rawMin: tiltInfo.min,
-      rawMax: tiltInfo.max,
-      logicalMinDeg: this.MIN_TILT,
-      logicalMaxDeg: this.MAX_TILT,
-      fallback: fallbackUnit,
-    });
+    const unitPan = this.unitPerDegFor(panInfo);
+    const unitTilt = this.unitPerDegFor(tiltInfo);
 
-    const rawPan = values.pan_absolute ?? 0;
-    const rawTilt = values.tilt_absolute ?? 0;
+    let rawPan = values.pan_absolute ?? 0;
+    let rawTilt = values.tilt_absolute ?? 0;
     const rawZoom = values.zoom_absolute ?? zoomInfo.min;
+
+    // Some drivers (or certain v4l2-ctl outputs) can show absurd current values.
+    // Clamp raw values into the advertised range before converting to degrees.
+    if (rawPan < panInfo.min || rawPan > panInfo.max) {
+      this.logger.warn({ rawPan, min: panInfo.min, max: panInfo.max }, '[PTZ] pan raw out of range; clamping');
+      rawPan = this.clamp(rawPan, panInfo.min, panInfo.max);
+    }
+    if (rawTilt < tiltInfo.min || rawTilt > tiltInfo.max) {
+      this.logger.warn({ rawTilt, min: tiltInfo.min, max: tiltInfo.max }, '[PTZ] tilt raw out of range; clamping');
+      rawTilt = this.clamp(rawTilt, tiltInfo.min, tiltInfo.max);
+    }
 
     // IMPORTANT:
     // - "readable" is not a reliable signal for capability (some drivers report garbage values).
@@ -183,8 +182,8 @@ export class TiltController {
     const pan = rawPan / unitPan;
     const tilt = rawTilt / unitTilt;
     // If unsupported, emit 0 so UI doesn't show absurd values.
-    const panOut = panSupported ? pan : 0;
-    const tiltOut = tiltSupported ? tilt : 0;
+    const panOut = panSupported ? this.clamp(pan, this.MIN_PAN, this.MAX_PAN) : 0;
+    const tiltOut = tiltSupported ? this.clamp(tilt, this.MIN_TILT, this.MAX_TILT) : 0;
 
     // Map raw zoom into logical ratio range [MIN_ZOOM_RATIO, MAX_ZOOM_RATIO]
     const rawZoomMin = zoomInfo.min;
@@ -203,8 +202,14 @@ export class TiltController {
     return {
       state: { pan: panOut, tilt: tiltOut, zoom },
       limits: {
-        pan: { min: panInfo.min / unitPan, max: panInfo.max / unitPan },
-        tilt: { min: tiltInfo.min / unitTilt, max: tiltInfo.max / unitTilt },
+        pan: {
+          min: this.clamp(panInfo.min / unitPan, this.MIN_PAN, this.MAX_PAN),
+          max: this.clamp(panInfo.max / unitPan, this.MIN_PAN, this.MAX_PAN),
+        },
+        tilt: {
+          min: this.clamp(tiltInfo.min / unitTilt, this.MIN_TILT, this.MAX_TILT),
+          max: this.clamp(tiltInfo.max / unitTilt, this.MIN_TILT, this.MAX_TILT),
+        },
         zoom: { min: this.MIN_ZOOM_RATIO, max: this.MAX_ZOOM_RATIO },
         supported: { pan: panSupported, tilt: tiltSupported, zoom: zoomSupported },
         raw: {
@@ -243,21 +248,8 @@ export class TiltController {
       getUvcControlInfo({ device: this.device, control: 'pan_absolute' }),
       getUvcControlInfo({ device: this.device, control: 'tilt_absolute' }),
     ]);
-    const fallbackUnit = this.unitPerDeg || 3600;
-    const unitPan = this.deriveUnitPerDegFromDriver({
-      rawMin: panInfo.min,
-      rawMax: panInfo.max,
-      logicalMinDeg: this.MIN_PAN,
-      logicalMaxDeg: this.MAX_PAN,
-      fallback: fallbackUnit,
-    });
-    const unitTilt = this.deriveUnitPerDegFromDriver({
-      rawMin: tiltInfo.min,
-      rawMax: tiltInfo.max,
-      logicalMinDeg: this.MIN_TILT,
-      logicalMaxDeg: this.MAX_TILT,
-      fallback: fallbackUnit,
-    });
+    const unitPan = this.unitPerDegFor(panInfo);
+    const unitTilt = this.unitPerDegFor(tiltInfo);
     const panRange = this.intersectRange(
       { min: this.MIN_PAN, max: this.MAX_PAN },
       { min: panInfo.min / unitPan, max: panInfo.max / unitPan }
@@ -392,12 +384,14 @@ export class TiltController {
     );
 
     // Send command to actual hardware (UVC tilt_absolute via v4l2-ctl)
+    const tiltInfo = await getUvcControlInfo({ device: this.device, control: 'tilt_absolute' });
+    const unitTilt = this.unitPerDegFor(tiltInfo);
     const result = await setUvcTiltAbsolute({
       device: this.device,
       angleDeg: angle,
       minDeg: this.MIN_TILT,
       maxDeg: this.MAX_TILT,
-      unitPerDeg: this.unitPerDeg,
+      unitPerDeg: unitTilt,
     });
 
     // Update state only after successful hardware call

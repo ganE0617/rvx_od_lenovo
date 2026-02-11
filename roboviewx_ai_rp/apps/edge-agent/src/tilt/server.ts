@@ -51,28 +51,62 @@ export class TiltServer {
       res.json({ status: 'ok' });
     });
 
-    // GET /ptz - Get current PTZ state
+    const sendPtzState = async (res: Response) => {
+      const { state, limits } = await this.controller.getPtzStateFromHardware();
+      // Match web-vanilla expectations: top-level pan/tilt/zoom (+ limits/supported).
+      res.json({
+        ok: true,
+        pan: state.pan,
+        tilt: state.tilt,
+        zoom: state.zoom,
+        supported: limits.supported,
+        limits: {
+          pan: limits.pan,
+          tilt: limits.tilt,
+          zoom: limits.zoom,
+          supported: limits.supported,
+        },
+      });
+    };
+
+    // GET /ptz - Get current PTZ state (edge-local)
     this.app.get('/ptz', (req: Request, res: Response) => {
       (async () => {
         try {
-          const { state, limits } = await this.controller.getPtzStateFromHardware();
-          res.json({ ok: true, state, limits });
+          await sendPtzState(res);
         } catch (error) {
-        this.logger.error({ error }, 'Error getting PTZ state');
-        res.status(500).json({
-          error: 'Internal server error',
-          message: error instanceof Error ? error.message : 'Unknown error',
-        });
+          this.logger.error({ error }, 'Error getting PTZ state');
+          res.status(500).json({
+            ok: false,
+            error: 'Internal server error',
+            message: error instanceof Error ? error.message : 'Unknown error',
+          });
         }
       })();
     });
 
-    // POST /ptz - Partial update for pan/tilt/zoom
-    this.app.post('/ptz', async (req: Request, res: Response) => {
+    // Compatibility for web-vanilla baseUrl: /api/robots/:roomId/ptz
+    this.app.get('/api/robots/:roomId/ptz', (req: Request, res: Response) => {
+      (async () => {
+        try {
+          await sendPtzState(res);
+        } catch (error) {
+          this.logger.error({ error }, 'Error getting PTZ state');
+          res.status(500).json({
+            ok: false,
+            error: 'Internal server error',
+            message: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
+      })();
+    });
+
+    async function handlePtzPost(this: TiltServer, req: Request, res: Response) {
       try {
         const body = req.body ?? {};
         if (body == null || typeof body !== 'object' || Array.isArray(body)) {
           return res.status(400).json({
+            ok: false,
             error: 'Bad request',
             message: 'Body must be a JSON object with optional pan/tilt/zoom fields',
           });
@@ -82,7 +116,6 @@ export class TiltServer {
         const tilt = (body as any).tilt;
         const zoom = (body as any).zoom;
 
-        // Validate types if present
         for (const [k, v] of [
           ['pan', pan],
           ['tilt', tilt],
@@ -90,6 +123,7 @@ export class TiltServer {
         ] as const) {
           if (v !== undefined && typeof v !== 'number') {
             return res.status(400).json({
+              ok: false,
               error: 'Bad request',
               message: `Field "${k}" must be a number`,
             });
@@ -102,9 +136,8 @@ export class TiltServer {
           ...(zoom !== undefined ? { zoom } : {}),
         });
 
-        // Read back from hardware to return the final applied state (useful when device clamps).
-        const { state: hwState, limits } = await this.controller.getPtzStateFromHardware();
-        res.json({ ok: true, state: hwState, limits });
+        // Read back for applied state
+        await sendPtzState(res);
       } catch (error) {
         this.logger.error({ error }, 'Error setting PTZ');
         const msg = error instanceof Error ? error.message : 'Unknown error';
@@ -112,10 +145,21 @@ export class TiltServer {
           msg.startsWith('Invalid ') ||
           msg.startsWith('Unsupported ');
         res.status(isClientError ? 400 : 500).json({
+          ok: false,
           error: isClientError ? 'Bad request' : 'Internal server error',
           message: msg,
         });
       }
+    }
+
+    // POST /ptz - Partial update for pan/tilt/zoom (edge-local)
+    this.app.post('/ptz', async (req: Request, res: Response) => {
+      await handlePtzPost.call(this, req, res);
+    });
+
+    // Compatibility POST: /api/robots/:roomId/ptz
+    this.app.post('/api/robots/:roomId/ptz', async (req: Request, res: Response) => {
+      await handlePtzPost.call(this, req, res);
     });
 
     // GET /tilt - Get current tilt angle
