@@ -1,20 +1,18 @@
 # RoboViewX Vanilla Web Viewer
 
-Pure JavaScript (no frameworks) live video viewer for AI Surveillance Service using mediasoup-client.
+Pure JavaScript (no frameworks) live video viewer for RoboViewX **P2P WebRTC**.
 
 ## Features
 
 - **No Frameworks**: Pure HTML5 + Vanilla JavaScript + TailwindCSS
-- **Mediasoup WebRTC**: Full SFU viewer implementation
-- **JSON-RPC Signaling**: WebSocket-based protocol matching server spec
-- **Auto-reconnect**: Exponential backoff on disconnect
-- **Robust Cleanup**: Idempotent resource management
+- **Native WebRTC P2P**: Browser ↔ Python aiortc worker direct connection
+- **WebSocket Signaling**: Simple join/offer/answer/candidate via edge-agent
+- **AI Overlay**: `detection_v1` JSON over DataChannel (`label="ai"`) rendered on canvas overlay
 
 ## Prerequisites
 
 - Node.js 18+
-- Running Media Server (port 3001)
-- Edge Agent publishing video
+- Edge Agent running (signaling + python worker)
 
 ## Installation
 
@@ -33,7 +31,7 @@ cp .env.example .env
 
 Configure:
 ```env
-VITE_SIGNALING_URL=ws://localhost:3001
+VITE_SIGNALING_URL=ws://localhost:8082/ws
 VITE_DEFAULT_ROOM_ID=robot-001
 ```
 
@@ -59,12 +57,9 @@ apps/web-vanilla/
 ├── index.html              # Main HTML (Tailwind classes)
 ├── src/
 │   ├── main.js            # Application entry point
-│   ├── rpcClient.js       # JSON-RPC WebSocket client
-│   ├── viewer.js          # Mediasoup viewer orchestration
+│   ├── viewer.js          # P2P viewer orchestration (RTCPeerConnection + WS signaling)
 │   ├── ui.js              # DOM manipulation & UI state
-│   ├── personDetectionOverlay.js  # AI overlay loop + canvas rendering
-│   ├── vision/
-│   │   └── yolo11Person.js        # YOLO11 preprocess/infer/postprocess (person-only)
+│   ├── aiOverlay.js       # Canvas overlay rendering (object-contain letterbox correction)
 │   └── styles.css         # Tailwind entry
 ├── vite.config.js         # Vite configuration
 ├── tailwind.config.js     # Tailwind configuration
@@ -74,27 +69,22 @@ apps/web-vanilla/
 
 ## Usage
 
-1. **Start Media Server**: `cd apps/media-server && npm run dev`
-2. **Start Edge Agent**: Ensure publisher is streaming to room
-3. **Open Vanilla Viewer**: `npm run dev` (this directory)
+1. **Start Edge Agent** (signaling + python worker)
+2. **Open Vanilla Viewer**: `npm run dev` (this directory)
 4. **Enter Room ID**: Default is `robot-001`
 5. **Click Connect**: Viewer joins and consumes video
-6. **(Optional) AI Overlay**: See `README_AI_DETECT.md` to run the server/edge inference service. In the UI, toggle **AI Overlay: ON** to show person boxes.
+6. **AI Overlay**: AI results are sent from the worker over DataChannel and drawn automatically.
 
-## Viewer Flow
+## Viewer Flow (P2P)
 
-Matches exact protocol from `packages/types`:
-
-1. WebSocket connect to signaling server
-2. `joinRoom` (role: viewer, peerId, roomId)
-3. Receive `rtpCapabilities` + existing producers
-4. Load mediasoup Device with capabilities
-5. `createWebRtcTransport` (consuming: true)
-6. Device creates recv transport
-7. Transport `connect` event → `connectWebRtcTransport` RPC with `dtlsParameters`
-8. For each producer: `consume` RPC → transport.consume() → `resume` RPC
-9. Attach video track to `<video>` element
-10. Handle `newProducer` and `producerClosed` events
+1. WebSocket connect to edge-agent signaling server
+2. `join` → receive `iceServers`
+3. Create `RTCPeerConnection({iceServers})`
+4. Create offer → send `offer`
+5. Receive `answer` → setRemoteDescription
+6. Trickle ICE: exchange `iceCandidate`
+7. `ontrack` → attach video to `<video>`
+8. `ondatachannel(label="ai")` → receive `detection_v1` → `aiOverlay.pushDetection()`
 
 ## Cleanup
 
@@ -110,35 +100,26 @@ All resources cleaned idempotently on disconnect:
 ### Video Not Playing
 
 - Check browser console for errors
-- Verify Media Server is running and accessible
-- Ensure Edge Agent is publishing to same room ID
-- Check `announcedIp` in Media Server config
+- Verify edge-agent signaling is reachable (`VITE_SIGNALING_URL`)
+- Ensure camera is available and worker can open `/dev/video0`
 
 ### Transport Connection Fails
 
-- Verify UDP ports 40000-49999 are open
 - Check firewall/NAT settings
-- Consider TURN server for restrictive networks
+- Configure TURN via `ICE_SERVERS_JSON` on edge-agent
 - Inspect WebRTC connection state in browser DevTools
 
 ### WebSocket Connection Error
 
-- Verify `VITE_SIGNALING_URL` matches Media Server
-- Check CORS settings on server
-- Ensure WebSocket endpoint is correct
+- Verify `VITE_SIGNALING_URL` points to edge-agent `/ws`
+- Ensure edge-agent is running and port is reachable
 
 ## End-to-End Verification Checklist
 
-1. ✅ Media Server running on port 3001
-2. ✅ Edge Agent publishing video to room
-3. ✅ Vite dev server running (port 5173)
-4. ✅ Page loads without errors
-5. ✅ Room ID field populated
-6. ✅ Click Connect → Status changes to CONNECTING
-7. ✅ Status changes to CONNECTED
-8. ✅ Status changes to PLAYING
-9. ✅ Video element displays live stream
-10. ✅ Click Disconnect → Clean shutdown
+1. ✅ Edge Agent running (signaling + python worker)
+2. ✅ Vite dev server running (port 5173)
+3. ✅ Click Connect → video plays
+4. ✅ `detection_v1` received (console) and overlay boxes render
 
 ## Key Implementation Details
 

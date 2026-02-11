@@ -1,11 +1,12 @@
-import { MediasoupViewer } from './viewer.js';
+import { P2PViewer } from './viewer.js';
 import { UI } from './ui.js';
 import { PtzController } from './ptzController.js';
 import { MotClient } from './mot.js';
 import { createAiOverlay } from './aiOverlay.js';
 
 // Environment variables
-const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || 'http://localhost:3001';
+// P2P signaling is WebSocket to edge-agent (e.g. ws://localhost:8082/ws)
+const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || 'ws://localhost:8082/ws';
 const DEFAULT_ROOM_ID = import.meta.env.VITE_DEFAULT_ROOM_ID || 'robot-001';
 
 // Generate unique peer ID
@@ -16,7 +17,7 @@ const ui = new UI();
 ui.init(SIGNALING_URL, DEFAULT_ROOM_ID, PEER_ID);
 
 // Initialize viewer
-const viewer = new MediasoupViewer(SIGNALING_URL);
+const viewer = new P2PViewer(SIGNALING_URL);
 
 // Initialize AI overlay (server/edge inference; default OFF)
 const aiOverlay = createAiOverlay({
@@ -67,13 +68,6 @@ ui.onConnect(async () => {
     } catch (error) {
         // viewer.onError will surface the error; avoid crashing on null rpcClient
         return;
-    }
-
-    // Listen for real-time PTZ sync from server (after connect ensures rpcClient is available)
-    if (viewer.rpcClient) {
-        viewer.rpcClient.on('ptz:state', (state) => {
-            ptzController.updateFromSync(state);
-        });
     }
 });
 
