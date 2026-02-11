@@ -1,20 +1,16 @@
 import { logger } from './logger';
 import { config } from './config';
-// Set PYTHON before any import that loads mediasoup-client-aiortc (Worker.js reads it at load time)
-import './rtc/setAiortcPythonEnv';
-import { ensureAiortcPythonEnv } from './rtc/aiortcWorker';
-import { Supervisor } from './lifecycle/supervisor';
 import { TiltServer } from './tilt/server';
+import { P2PSignalingServer } from './p2p/signalingServer';
 
 /**
  * Edge Agent - Main Entry Point
  *
- * This agent runs on Raspberry Pi 4 and:
- * 1. Connects to mediasoup SFU server via WebSocket
- * 2. Joins a room as a publisher
- * 3. Produces a video track (test pattern for MVP)
- * 4. Provides tilt control via REST API
- * 5. Handles reconnection with exponential backoff
+ * P2P Architecture (no mediasoup):
+ * - Node runs a minimal WebSocket signaling server
+ * - Node supervises a Python aiortc worker subprocess
+ * - Python worker owns /dev/video0, sends video via WebRTC P2P and AI detections via DataChannel ("ai")
+ * - Viewer (web-vanilla) connects directly to the Python worker using native WebRTC
  */
 
 async function main() {
@@ -22,7 +18,7 @@ async function main() {
     {
       roomId: config.roomId,
       peerId: config.peerId,
-      signalingUrl: config.signalingUrl,
+      signalingUrl: '(p2p-local)',
       videoSource: config.videoSource,
       edgeVideoSource: config.edgeVideoSource,
       appDataSource: config.appDataSource,
@@ -31,40 +27,18 @@ async function main() {
     },
     'Starting Edge Agent'
   );
-  logger.info(`Final signaling URL: ${config.signalingUrl}`);
-
-  ensureAiortcPythonEnv(logger);
-
-  // Create supervisor
-  const supervisor = new Supervisor(logger);
+  logger.info('P2P signaling + python worker mode (mediasoup disabled)');
 
   // Create tilt server
   const tiltServer = new TiltServer(logger);
-
-  // Handle supervisor events
-  supervisor.on('connected', () => {
-    logger.info('✓ Edge agent connected and producing video');
-  });
-
-  supervisor.on('disconnected', () => {
-    logger.warn('Edge agent disconnected');
-  });
-
-  supervisor.on('failed', () => {
-    logger.error('Edge agent failed - max retries reached');
-    process.exit(1);
-  });
-
-  supervisor.on('stopped', () => {
-    logger.info('Edge agent stopped');
-  });
+  const signalingServer = new P2PSignalingServer(logger);
 
   // Graceful shutdown handler
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Received shutdown signal');
 
     try {
-      await supervisor.stop();
+      await signalingServer.stop();
       await tiltServer.stop();
       logger.info('Graceful shutdown complete');
       process.exit(0);
@@ -128,8 +102,8 @@ async function main() {
       }
     }
 
-    // Start supervisor (connects and produces video)
-    await supervisor.start();
+    // Start P2P signaling server (spawns python worker)
+    await signalingServer.start();
 
     logger.info('Edge Agent running');
     logger.info('Press Ctrl+C to stop');

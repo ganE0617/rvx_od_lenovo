@@ -3,17 +3,16 @@
 <!-- Run with camera: EDGE_VIDEO_SOURCE=v4l2:/dev/video0 pnpm run dev -->
 <!-- With size/fps: EDGE_VIDEO_SOURCE=v4l2:/dev/video2?size=1280x720&fps=30 pnpm run dev -->
 
-WebRTC-based edge agent for Raspberry Pi 4 that streams video to a mediasoup SFU server and provides tilt control.
+WebRTC-based edge agent that provides **P2P WebRTC** video + AI detections from a Python `aiortc` worker subprocess, plus tilt control.
 
 ## Architecture
 
 The edge agent:
-- Connects to a mediasoup SFU server via WebSocket (JSON-RPC signaling)
-- Joins a room as a `publisher` role
-- Creates a WebRTC send transport
-- Produces a video track (test pattern or file source)
+- Hosts a **WebSocket signaling server** (`/ws`)
+- Spawns/supervises a **Python aiortc worker** (`python/p2p_webrtc_worker.py`)
+- Python worker owns `/dev/video0`, captures+encodes video, and sends it **P2P** to the browser
+- Python worker runs YOLO inference and sends `detection_v1` over a WebRTC **DataChannel** labeled `ai`
 - Provides HTTP REST API for tilt control
-- Handles reconnection with exponential backoff
 
 ## Prerequisites
 
@@ -51,18 +50,9 @@ The edge agent:
 
 ## Installation
 
-From the monorepo root:
-
 ```bash
-# Install all dependencies
-pnpm install
-
-# Build shared packages
-pnpm build
-
-# Or build just the edge-agent
 cd apps/edge-agent
-pnpm build
+npm install
 ```
 
 ## Configuration
@@ -74,8 +64,12 @@ Create a `.env` file in `apps/edge-agent/` (or set environment variables):
 EDGE_ROOM_ID=robot-001
 EDGE_PEER_ID=edge-pi-001
 
-# Signaling Server
-SIGNALING_URL=ws://192.168.1.100:3000
+### P2P signaling (edge-agent hosts it)
+SIGNALING_HOST=0.0.0.0
+SIGNALING_PORT=8082
+
+### ICE servers (STUN/TURN)
+ICE_SERVERS_JSON='[{"urls":["stun:stun.l.google.com:19302"]}]'
 
 # Video Source (default: v4l2 camera)
 EDGE_VIDEO_SOURCE=v4l2:/dev/video0   # Default. Or: v4l2:/dev/video0?size=1280x720&fps=30&format=mjpeg, testsrc, file
@@ -85,19 +79,17 @@ VIDEO_WIDTH=640
 VIDEO_HEIGHT=480
 VIDEO_FRAMERATE=30
 
-# Codec
-CODEC=VP8                      # Options: VP8, H264 (VP8 recommended)
+P2P_VIDEO_CODEC=vp8            # Options: vp8, h264
 
-# TURN/STUN (optional)
-TURN_URLS=turn:turn.example.com:3478
-TURN_USERNAME=username
-TURN_CREDENTIAL=password
-
-# Reconnection
-RECONNECT_ENABLED=true
-RECONNECT_MAX_RETRIES=10
-RECONNECT_BASE_DELAY_MS=1000
-RECONNECT_MAX_DELAY_MS=30000
+### Edge AI (optional)
+AI_ENABLE=1
+AI_MODEL_PATH=/abs/path/to/yolo11n.pt
+AI_FPS=10
+AI_SEND_HZ=12
+AI_CONF=0.25
+AI_IOU=0.45
+AI_INPUT_W=640
+AI_INPUT_H=360
 
 # Tilt REST API
 TILT_PORT=8080
@@ -118,22 +110,9 @@ Python venv can live at monorepo root so you don’t need to `cd` into `apps/edg
 EDGE_VIDEO_SOURCE="v4l2:/dev/video0?size=1280x720&fps=30&format=mjpeg" pnpm -C apps/edge-agent run dev
 ```
 
-## Snapshot feed (for AI inference, no second camera open)
-
-The aiortc worker process (which owns the camera via `MediaPlayer(..., format='v4l2')`) exposes:
-
-- `GET http://127.0.0.1:8082/snapshot.jpg`
-
-Configure (optional env vars when starting the edge-agent):
-
-- `AIORTC_SNAPSHOT_PORT` (default `8082`, set `0` to disable)
-- `AIORTC_SNAPSHOT_FPS` (default `5`, recommended `2-5` for stability)
-- `AIORTC_SNAPSHOT_W` / `AIORTC_SNAPSHOT_H` (optional fixed encode size)
-- `AIORTC_SNAPSHOT_QUALITY` (default `80`)
-
 ## Edge AI (YOLO) over WebRTC DataChannel (main path)
 
-The edge-agent can run person detection **on the same raw frames used for WebRTC video** and send `detection_v1` JSON to viewers over a mediasoup **DataChannel** (label `ai`).
+The python worker runs YOLO **on the same decoded frames** and sends `detection_v1` JSON to the browser over WebRTC DataChannel (`label="ai"`).
 
 Enable with env vars:
 
@@ -155,12 +134,12 @@ bash apps/edge-agent/scripts/install-aiortc.sh --monorepo
 Run example:
 
 ```bash
-AI_ENABLE=1 \
-AI_MODEL_PATH="/home/spacebank/roboviewx_ai/apps/ai-inference/yolo11n.pt" \
-AI_FPS=10 AI_SEND_HZ=12 AI_CONF=0.2 AI_INPUT_W=640 AI_INPUT_H=360 \
+SIGNALING_PORT=8082 \
+ICE_SERVERS_JSON='[{"urls":["stun:stun.l.google.com:19302"]}]' \
 EDGE_ROOM_ID=robot-001 \
-SIGNALING_URL="http://127.0.0.1:3001" \
-EDGE_VIDEO_SOURCE="v4l2:/dev/video0?size=640x360&fps=30&format=mjpeg" \
+EDGE_VIDEO_SOURCE="v4l2:/dev/video0?size=1280x720&fps=30&format=mjpeg" \
+AI_ENABLE=1 AI_MODEL_PATH="/abs/path/to/yolo11n.pt" \
+AI_FPS=10 AI_SEND_HZ=12 AI_CONF=0.25 AI_IOU=0.45 AI_INPUT_W=640 AI_INPUT_H=360 \
 npm run dev
 ```
 
@@ -272,35 +251,9 @@ Response:
 
 ## End-to-End Testing
 
-### 1. Start the media server
-```bash
-cd apps/media-server
-pnpm start
-```
-
-### 2. Start the edge agent
-```bash
-cd apps/edge-agent
-pnpm start
-```
-
-You should see logs indicating:
-```
-✓ Tilt REST API listening on port 8080
-Connecting to signaling server
-WebSocket connected
-Joined room
-Device initialized
-Send transport created
-Video producer created
-✓ Edge agent connected and producing video
-```
-
-### 3. Open a web viewer
-Open a browser and navigate to your media server's viewer URL (typically `http://localhost:3000` or similar).
-
-### 4. Verify video is visible
-You should see the test pattern (color bars) streaming from the edge agent.
+1) Start the edge-agent (signaling + python worker)  
+2) Start `apps/web-vanilla` with `VITE_SIGNALING_URL=ws://<edge>:8082/ws`  
+3) Click Connect → video plays → boxes render when detections exist
 
 ### 5. Test tilt control
 ```bash
