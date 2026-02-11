@@ -1,0 +1,18 @@
+[Unit]
+Description=Edge Agent - WebRTC Video Streaming
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/edge-agent-monorepo/apps/edge-agent
+Environment="NODE_ENV=production"
+EnvironmentFile=/home/admin/edge-agent-monorepo/apps/edge-agent/.env
+ExecStart=/usr/bin/node /home/admin/edge-agent-monorepo/apps/edge-agent/dist/index.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,710 @@
+--- package/worker/worker.py	1985-10-26 17:15:00.000000000 +0900
++++ package/worker/worker.py	2026-02-11 13:59:57.591039725 +0900
+@@ -1,6 +1,13 @@
+ import argparse
++import json
+ import traceback
+ import asyncio
++import os
++import sys
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from urllib.parse import urlparse, parse_qs
+ from os import getpid
+ from typing import Any, Dict
+ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection
+@@ -8,6 +15,393 @@
+ from channel import Request, Notification, Channel
+ from handler import Handler
+ from logger import Logger
++try:
++    import edge_snapshot_store  # type: ignore
++except Exception:
++    edge_snapshot_store = None
++
++try:
++    import edge_ai_detector  # type: ignore
++except Exception:
++    edge_ai_detector = None
++
++try:
++    import edge_yolo_detector  # type: ignore
++except Exception:
++    edge_yolo_detector = None
++
++try:
++    import av  # type: ignore
++except Exception:
++    av = None
++
++# === Snapshot feed (latest JPEG) ============================================
++#
++# Purpose: provide GET /snapshot.jpg without opening /dev/video0 twice.
++# This runs inside the SAME Python worker process that owns the camera (MediaPlayer v4l2).
++#
++# - Tap outgoing video track frames (recv)
++# - Background encoder at fixed FPS stores latest JPEG bytes
++# - HTTP handler returns latest bytes (last-frame only; no queues)
++#
++# Env:
++#   AIORTC_SNAPSHOT_PORT (default 8082; set to 0 to disable)
++#   AIORTC_SNAPSHOT_FPS  (default 5)
++#   AIORTC_SNAPSHOT_W / AIORTC_SNAPSHOT_H (optional; if set, encode at that size)
++#   AIORTC_SNAPSHOT_QUALITY (default 80)
++
++_snapshot_port = int(os.environ.get("AIORTC_SNAPSHOT_PORT", "8082"))
++_snapshot_fps = float(os.environ.get("AIORTC_SNAPSHOT_FPS", "5"))
++_snapshot_w = int(os.environ.get("AIORTC_SNAPSHOT_W", "0"))
++_snapshot_h = int(os.environ.get("AIORTC_SNAPSHOT_H", "0"))
++_snapshot_quality = int(os.environ.get("AIORTC_SNAPSHOT_QUALITY", "80"))
++
++_snap_lock = threading.Lock()
++_snap_stop = threading.Event()
++
++_ai_stop = threading.Event()
++
++
++def _snapshot_encoder_loop() -> None:
++    # Kept only as a low-overhead "alive" logger.
++    # Heavy encoding happens inside edge_snapshot_store's background thread.
++    interval = 1.0 / max(1e-6, _snapshot_fps)
++    last_log = 0.0
++    while not _snap_stop.is_set():
++        time.sleep(interval)
++        now = time.time()
++        if now - last_log > 10.0:
++            last_log = now
++            if edge_snapshot_store is None:
++                continue
++            st = edge_snapshot_store.STORE.status(getpid()).to_dict()
++            Logger.debug(
++                f"snapshot: alive frames={st.get('framesInTotal')} jpegBytes={st.get('jpegBytes')} encOk={st.get('encodeOkTotal')} encFail={st.get('encodeFailTotal')}"
++            )
++
++
++def _ai_send_loop(handlers_ref) -> None:
++    """
++    Periodically sends latest detection_v1 JSON over any open DataChannel with label 'ai'.
++    This avoids routing detections through Node, minimizing latency and overhead.
++    """
++
++    # ── Diagnostics: print env flags once at thread start ──
++    # Use Logger.warning so messages appear even at default logLevel=warn
++    Logger.warning(
++        "ai: _ai_send_loop thread started | env: "
++        + str({
++            "AI_ENABLE": os.environ.get("AI_ENABLE", ""),
++            "AI_FORCE_BOX": os.environ.get("AI_FORCE_BOX", ""),
++            "AI_MODEL_PATH": os.environ.get("AI_MODEL_PATH", ""),
++            "AI_SEND_HZ": os.environ.get("AI_SEND_HZ", "12"),
++            "AI_FPS": os.environ.get("AI_FPS", "10"),
++            "AI_CONF": os.environ.get("AI_CONF", "0.2"),
++            "AI_IOU": os.environ.get("AI_IOU", "0.45"),
++            "AI_INPUT_W": os.environ.get("AI_INPUT_W", "640"),
++            "AI_INPUT_H": os.environ.get("AI_INPUT_H", "360"),
++            "AI_CLASSES": os.environ.get("AI_CLASSES", ""),
++            "python": sys.executable,
++        })
++    )
++
++    if edge_yolo_detector is None:
++        Logger.warning("ai: edge_yolo_detector import failed; AI disabled. sys.path=" + str(sys.path[:5]))
++        return
++
++    # Debug mode: when Node is sending a moving bbox (AI_FORCE_BOX=1),
++    # do not also send YOLO-based detection_v1 here (prevents duplicate streams).
++    if str(os.environ.get("AI_FORCE_BOX", "")).lower() in ("1", "true", "yes", "on"):
++        Logger.warning("ai: AI_FORCE_BOX=1 set; skipping YOLO detection_v1 sender loop (Node sends debug boxes)")
++        return
++
++    send_hz = max(1e-6, float(os.environ.get("AI_SEND_HZ", "12")))
++    send_interval = 1.0 / send_hz
++    last_status_log = 0.0
++    last_tx_log = 0.0
++    tx_total = 0
++    loop_iter = 0
++    last_loop_alive_log = 0.0
++
++    Logger.warning(f"ai: YOLO sender loop started (sendHz={send_hz:.1f}, interval={send_interval:.3f}s)")
++
++    while not _ai_stop.is_set():
++        try:
++            loop_iter += 1
++            now = time.time()
++
++            # ── Periodic "alive" log (1/sec) ──
++            has_frame = False
++            try:
++                latest, err, infer_ms, model_loaded = edge_yolo_detector.DETECTOR.get_latest()
++                dets = latest.get("detections") or []
++                has_frame = bool(latest.get("frame_id", 0))
++            except Exception as e:
++                latest = {}
++                err = str(e)
++                infer_ms = 0
++                model_loaded = False
++                dets = []
++
++            if (now - last_loop_alive_log) >= 1.0:
++                last_loop_alive_log = now
++                # Count open 'ai' DataChannels with detailed diagnostics
++                dc_count = 0
++                handler_count = len(handlers_ref)
++                dc_detail = ""
++                for hid, h in list(handlers_ref.items()):
++                    try:
++                        dcs_dict = getattr(h, "_dataChannels", {})
++                        dc_labels = []
++                        for dcid, dc in list(dcs_dict.items()):
++                            lbl = getattr(dc, "label", "?")
++                            rs = getattr(dc, "readyState", "?")
++                            dc_labels.append(f"{lbl}:{rs}")
++                            if lbl == "ai" and rs == "open":
++                                dc_count += 1
++                        if dc_labels:
++                            dc_detail += f" h[{hid[:8]}]={dc_labels}"
++                    except Exception as _e:
++                        dc_detail += f" h[{hid[:8]}]=err:{_e}"
++                Logger.warning(
++                    f"ai: YOLO loop alive iter={loop_iter} dets={len(dets)} "
++                    f"hasFrame={has_frame} modelLoaded={model_loaded} "
++                    f"handlers={handler_count} openDCs={dc_count}{dc_detail} err={err or 'none'}"
++                )
++
++            robot_id = os.environ.get("EDGE_ROOM_ID", "robot-001")
++            fw = int(latest.get("frame_w") or int(os.environ.get("AI_INPUT_W", "640") or 640))
++            fh = int(latest.get("frame_h") or int(os.environ.get("AI_INPUT_H", "360") or 360))
++            frame_id = int(latest.get("frame_id") or 0)
++            ts_ms = int(latest.get("ts_ms") or int(time.time() * 1000))
++
++            out_obj = {
++                "type": "detection_v1",
++                "robotId": robot_id,
++                "ts_ms": ts_ms,
++                "frame": {"w": fw, "h": fh, "id": frame_id},
++                "detections": dets,
++            }
++
++            out_payload = json.dumps(out_obj, separators=(",", ":"), ensure_ascii=False)
++
++            # Send detection via stderr to Node.js (because aiortc DataChannel
++            # never reaches 'open' state — mediasoup handles SCTP on the server).
++            # Node.js intercepts __AI_DET__: prefix and forwards via dataProducer.send().
++            try:
++                sys.stderr.write("__AI_DET__:" + out_payload + "\n")
++                sys.stderr.flush()
++                tx_total += 1
++            except Exception:
++                pass
++
++            if (now - last_status_log) > 5.0:
++                last_status_log = now
++                if not model_loaded:
++                    Logger.warning("ai: yolo model not loaded yet")
++                if err:
++                    Logger.warning(f"ai: yolo status err={err}")
++
++            if (now - last_tx_log) > 1.0:
++                last_tx_log = now
++                dets_len = len(out_obj.get("detections") or [])
++                Logger.warning(
++                    f"ai: TX detection_v1 via stderr dets={dets_len} conf={os.environ.get('AI_CONF', '0.2')} "
++                    f"inferMs={int(infer_ms or 0)} txTotal={tx_total}"
++                )
++
++        except Exception:
++            # NEVER let an exception kill the sender thread. Log and continue.
++            now = time.time()
++            if (now - last_status_log) > 2.0:
++                last_status_log = now
++                Logger.warning("ai: _ai_send_loop exception (continuing):\n" + traceback.format_exc())
++
++        time.sleep(send_interval)
++
++
++class _SnapshotHandler(BaseHTTPRequestHandler):
++    def do_HEAD(self):  # noqa: N802
++        u = urlparse(self.path)
++        if u.path != "/snapshot.jpg":
++            self.send_response(404)
++            self.end_headers()
++            return
++
++        if edge_snapshot_store is None:
++            jpeg = None
++            meta = {"w": 0, "h": 0, "ts_ms": 0}
++        else:
++            jpeg = edge_snapshot_store.STORE.get_cached_jpeg()
++            meta = edge_snapshot_store.STORE.jpeg_meta()
++
++        if jpeg is None:
++            self.send_response(503)
++            self.send_header("Content-Length", "0")
++            self.send_header("Cache-Control", "no-store, max-age=0")
++            self.end_headers()
++            return
++
++        self.send_response(200)
++        self.send_header("Content-Type", "image/jpeg")
++        self.send_header("Content-Length", str(len(jpeg)))
++        self.send_header("Cache-Control", "no-store, max-age=0")
++        self.send_header("X-Frame-W", str(meta.get("w", 0)))
++        self.send_header("X-Frame-H", str(meta.get("h", 0)))
++        self.send_header("X-Frame-TsMs", str(meta.get("ts_ms", 0) or 0))
++        self.end_headers()
++
++    def do_GET(self):  # noqa: N802
++        u = urlparse(self.path)
++        if u.path == "/snapshot/ping":
++            body = b"ok"
++            self.send_response(200)
++            self.send_header("Content-Type", "text/plain")
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Cache-Control", "no-store, max-age=0")
++            self.end_headers()
++            try:
++                self.wfile.write(body)
++            except Exception:
++                pass
++            return
++
++        if u.path == "/snapshot/status":
++            if edge_snapshot_store is None:
++                payload = {
++                    "ok": False,
++                    "pid": getpid(),
++                    "hasFrame": False,
++                    "lastFrameTsMs": None,
++                    "lastJpegTsMs": None,
++                    "jpegBytes": 0,
++                    "framesInTotal": 0,
++                    "encodeOkTotal": 0,
++                    "encodeFailTotal": 0,
++                    "lastEncodeError": "edge_snapshot_store import failed (PYTHONPATH not set?)",
++                    "source": "",
++                    "port": _snapshot_port,
++                    "encoderFps": _snapshot_fps,
++                    "lastRawShape": None,
++                    "lastRawType": None,
++                }
++            else:
++                payload = edge_snapshot_store.STORE.status(getpid()).to_dict()
++            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Cache-Control", "no-store, max-age=0")
++            self.end_headers()
++            try:
++                self.wfile.write(body)
++            except Exception:
++                pass
++            return
++
++        if u.path != "/snapshot.jpg":
++            self.send_response(404)
++            self.end_headers()
++            return
++
++        # Optional query w/h: request resize for next background encode.
++        # Handler remains fast: it returns cached bytes only (no heavy encode here).
++        qs = parse_qs(u.query)
++        qw = int(qs.get("w", ["0"])[0] or "0")
++        qh = int(qs.get("h", ["0"])[0] or "0")
++        qw = int(qw) if qw else 0
++        qh = int(qh) if qh else 0
++
++        # Cap to avoid accidental huge encodes
++        if qw and (qw < 16 or qw > 4096):
++            qw = 0
++        if qh and (qh < 16 or qh > 4096):
++            qh = 0
++
++        if qw and not qh:
++            qh = qw
++        if qh and not qw:
++            qw = qh
++
++        if edge_snapshot_store is None:
++            jpeg = None
++            meta = {"w": 0, "h": 0, "ts_ms": 0}
++        else:
++            if qw or qh:
++                edge_snapshot_store.STORE.request_size(qw, qh)
++            jpeg = edge_snapshot_store.STORE.get_cached_jpeg()
++            meta = edge_snapshot_store.STORE.jpeg_meta()
++
++        # If request wants a specific size, only return if cache matches.
++        if (qw and int(meta.get("w") or 0) != qw) or (qh and int(meta.get("h") or 0) != qh):
++            jpeg = None
++
++        if not jpeg:
++            self.send_response(503)
++            self.send_header("Content-Length", "0")
++            self.send_header("Cache-Control", "no-store, max-age=0")
++            self.end_headers()
++            return
++        self.send_response(200)
++        self.send_header("Content-Type", "image/jpeg")
++        self.send_header("Content-Length", str(len(jpeg)))
++        self.send_header("Cache-Control", "no-store, max-age=0")
++        self.send_header("X-Frame-W", str(meta.get("w", 0)))
++        self.send_header("X-Frame-H", str(meta.get("h", 0)))
++        self.send_header("X-Frame-TsMs", str(meta.get("ts_ms", 0) or 0))
++        self.end_headers()
++        try:
++            self.wfile.write(jpeg)
++        except Exception:
++            return
++
++    def log_message(self, format, *args):  # noqa: A002
++        # silence default http.server logging
++        return
++
++
++def _start_snapshot_server() -> None:
++    if _snapshot_port <= 0:
++        return
++    try:
++        httpd = ThreadingHTTPServer(("0.0.0.0", _snapshot_port), _SnapshotHandler)
++    except Exception as e:
++        Logger.error(f"snapshot: failed to bind port {_snapshot_port}: {e}")
++        return
++
++    t_enc = threading.Thread(target=_snapshot_encoder_loop, daemon=True)
++    t_enc.start()
++
++    def _serve():
++        Logger.debug(f"snapshot: http server listening on 0.0.0.0:{_snapshot_port} (GET /snapshot.jpg, /snapshot/status, /snapshot/ping)")
++        try:
++            httpd.serve_forever(poll_interval=0.5)
++        except Exception:
++            pass
++
++    t_http = threading.Thread(target=_serve, daemon=True)
++    t_http.start()
++
++    # Store shutdown closure on globals
++    def _shutdown():
++        try:
++            httpd.shutdown()
++        except Exception:
++            pass
++        try:
++            httpd.server_close()
++        except Exception:
++            pass
++
++    global _snapshot_shutdown
++    _snapshot_shutdown = _shutdown
++
++
++# NOTE: _EdgeTapVideoTrack wrapper class removed — wrapping the track with a
++# new MediaStreamTrack subclass breaks aiortc's internal DTLS/RTP sender
++# (bytesReceived=0 on server). Instead we monkey-patch recv() on the
++# original PlayerStreamTrack in getTrack() below.
++
+ 
+ # File descriptor to communicate with the Node.js process
+ CHANNEL_FD = 3
+@@ -44,12 +438,128 @@
+     # create channel
+     channel = Channel(CHANNEL_FD)
+ 
++    # Start snapshot HTTP server (in background threads).
++    _snapshot_shutdown = None
++    _start_snapshot_server()
++
++    # Start AI sender loop (in background thread) if enabled.
++    _ai_thread = None
++    try:
++        ai_enable = str(os.environ.get("AI_ENABLE", "")).lower() in ("1", "true", "yes", "on")
++        Logger.warning(
++            f"ai: startup check: AI_ENABLE={os.environ.get('AI_ENABLE','')} "
++            f"ai_enable={ai_enable} "
++            f"edge_yolo_detector={'loaded' if edge_yolo_detector is not None else 'NONE'} "
++            f"AI_FORCE_BOX={os.environ.get('AI_FORCE_BOX','')} "
++            f"AI_MODEL_PATH={os.environ.get('AI_MODEL_PATH','(unset)')}"
++        )
++        if ai_enable and edge_yolo_detector is not None:
++            try:
++                edge_yolo_detector.DETECTOR.start()
++                Logger.warning(
++                    f"ai: DETECTOR.start() called "
++                    f"has_deps={edge_yolo_detector.DETECTOR._has_deps} "
++                    f"started={edge_yolo_detector.DETECTOR._started} "
++                    f"model_path={edge_yolo_detector.DETECTOR.model_path}"
++                )
++            except Exception as e:
++                Logger.warning(f"ai: DETECTOR.start() failed: {e.__class__.__name__}: {e}")
++            _ai_thread = threading.Thread(target=_ai_send_loop, args=(handlers,), daemon=True)
++            _ai_thread.start()
++            Logger.warning("ai: yolo sender thread launched (label=ai)")
++        elif ai_enable and edge_yolo_detector is None:
++            Logger.warning(f"ai: AI_ENABLE=1 but edge_yolo_detector import failed; sys.path={sys.path[:6]}")
++        elif not ai_enable:
++            Logger.warning("ai: AI_ENABLE not set; AI sender disabled")
++    except Exception:
++        Logger.warning("ai: startup exception:\n" + traceback.format_exc())
++
+     def getTrack(playerId: str, kind: str) -> MediaStreamTrack:
+         player = players[playerId]
+         track = player.audio if kind == "audio" else player.video
+         if not track:
+             raise Exception("no track found")
+ 
++        # Monkey-patch recv() on the ORIGINAL track object for AI frame access.
++        # We do NOT wrap or replace the track (player.video has no setter, and
++        # wrapping with a new MediaStreamTrack subclass breaks aiortc's internal
++        # DTLS/RTP sender pipeline). Instead, we patch recv() in-place so the
++        # exact same track object is used by aiortc's RTCRtpSender.
++        if kind == "video" and ai_enable and not getattr(track, '_ai_recv_patched', False):
++            _orig_recv = track.recv
++            _tap_state = {
++                'recv_count': 0,
++                'submit_count': 0,
++                'last_diag': 0.0,
++                'last_err_log': 0.0,
++                'first_logged': False,
++            }
++
++            async def _patched_recv():
++                frame = await _orig_recv()
++                try:
++                    if not _tap_state['first_logged']:
++                        _tap_state['first_logged'] = True
++                        sys.stderr.write("ai: patched recv() called for FIRST time\n")
++                        sys.stderr.flush()
++
++                    _tap_state['recv_count'] += 1
++                    _now = time.time()
++
++                    if av is None:
++                        if (_now - _tap_state['last_diag']) > 5.0:
++                            _tap_state['last_diag'] = _now
++                            Logger.warning("ai: frame tap: av module is None")
++                        return frame
++                    if not isinstance(frame, av.VideoFrame):
++                        if (_now - _tap_state['last_diag']) > 5.0:
++                            _tap_state['last_diag'] = _now
++                            Logger.warning(f"ai: frame tap: not VideoFrame, got {type(frame).__name__}")
++                        return frame
++
++                    need_bgr = False
++                    if edge_snapshot_store is not None and edge_snapshot_store.STORE.want_frame():
++                        need_bgr = True
++                    if edge_ai_detector is not None and edge_ai_detector.DETECTOR.want_frame():
++                        need_bgr = True
++                    if edge_yolo_detector is not None and edge_yolo_detector.DETECTOR.want_frame():
++                        need_bgr = True
++                    if not need_bgr:
++                        return frame
++
++                    bgr = frame.to_ndarray(format="bgr24")
++                    if edge_snapshot_store is not None and edge_snapshot_store.STORE.want_frame():
++                        edge_snapshot_store.STORE.update_raw_frame_bgr(bgr)
++                    if edge_ai_detector is not None and edge_ai_detector.DETECTOR.want_frame():
++                        edge_ai_detector.DETECTOR.submit_frame_bgr(bgr, ts_ms=int(time.time() * 1000))
++                    if edge_yolo_detector is not None and edge_yolo_detector.DETECTOR.want_frame():
++                        edge_yolo_detector.DETECTOR.submit_frame_bgr(bgr, ts_ms=int(time.time() * 1000))
++                        _tap_state['submit_count'] += 1
++
++                    if (_now - _tap_state['last_diag']) > 5.0:
++                        _tap_state['last_diag'] = _now
++                        Logger.warning(
++                            f"ai: frame tap diag: recvCount={_tap_state['recv_count']} "
++                            f"submitCount={_tap_state['submit_count']} "
++                            f"bgrShape={bgr.shape if bgr is not None else None}"
++                        )
++                except Exception as _tap_exc:
++                    try:
++                        _t = time.time()
++                        if _t - _tap_state['last_err_log'] > 5.0:
++                            _tap_state['last_err_log'] = _t
++                            Logger.warning(f"ai: frame tap error: {_tap_exc.__class__.__name__}: {_tap_exc}")
++                    except Exception:
++                        pass
++                return frame
++
++            track.recv = _patched_recv
++            track._ai_recv_patched = True
++            Logger.warning(
++                f"ai: monkey-patched recv() on video track (playerId={playerId}) "
++                f"trackClass={track.__class__.__name__} trackId={track.id}"
++            )
++
+         return track
+ 
+     def addRemoteTrack(track: MediaStreamTrack) -> None:
+@@ -101,6 +611,14 @@
+             internal = request.internal
+             playerId = internal["playerId"]
+             data = request.data
++            try:
++                src_file = data.get("file", "")
++                src_fmt = data.get("format", "")
++                if src_file and (src_fmt == "v4l2" or str(src_file).startswith("/dev/video")):
++                    if edge_snapshot_store is not None:
++                        edge_snapshot_store.STORE.set_source(f"{src_file} (format={src_fmt})")
++            except Exception:
++                pass
+             player = MediaPlayer(
+                 data["file"],
+                 format=data["format"] if "format" in data else None,
+@@ -111,6 +629,15 @@
+             )
+ 
+             # store the player in the map
++            # NOTE: player.video is read-only (no setter). Frame tapping is done
++            # via monkey-patching recv() in getTrack() when the handler requests the track.
++            try:
++                if player.video:
++                    Logger.warning(f"ai: player created with video track (playerId={playerId}, trackClass={player.video.__class__.__name__})")
++                else:
++                    Logger.warning(f"ai: player.video is None/falsy (playerId={playerId})")
++            except Exception as _wrap_err:
++                Logger.warning(f"ai: createPlayer note: {_wrap_err}")
+             players[playerId] = player
+ 
+             result = {}
+@@ -299,3 +826,28 @@
+         loop.run_until_complete(
+             shutdown()
+         )
++        # stop snapshot threads/server
++        try:
++            _snap_stop.set()
++        except Exception:
++            pass
++        try:
++            if edge_snapshot_store is not None:
++                edge_snapshot_store.STORE.stop()
++        except Exception:
++            pass
++        # stop AI sender/detector
++        try:
++            _ai_stop.set()
++        except Exception:
++            pass
++        try:
++            if edge_ai_detector is not None:
++                edge_ai_detector.DETECTOR.stop()
++        except Exception:
++            pass
++        try:
++            if _snapshot_shutdown:
++                _snapshot_shutdown()
++        except Exception:
++            pass
+--- package/worker/handler.py	1985-10-26 17:15:00.000000000 +0900
++++ package/worker/handler.py	2026-02-11 13:45:11.429795502 +0900
+@@ -1,6 +1,7 @@
+ from typing import Any, Dict, Optional, List
+ import base64
+ import asyncio
++import re
+ from aiortc import (
+     RTCConfiguration,
+     RTCPeerConnection,
+@@ -165,6 +166,40 @@
+                 raise TypeError("request data not a RTCSessionDescription")
+ 
+             description = RTCSessionDescription(**data)
++            if description.sdp:
++                setups = re.findall(r"^a=setup:.*$", description.sdp, flags=re.M)
++                print(f"[SDP_SETUP] setLocalDescription type={description.type} setups={setups}")
++            
++            # PATCH: Force DTLS role to 'active' (client) for mediasoup compatibility
++            # mediasoup expects the connecting endpoint to be DTLS client.
++            # aiortc may generate offer with setup:actpass or setup:passive,
++            # but we need setup:active for same-host local dev.
++            if description.type == "offer" and description.sdp:
++                # Log original setup value
++                original_setup = None
++                for line in description.sdp.split('\r\n'):
++                    if line.startswith('a=setup:'):
++                        original_setup = line
++                        break
++                
++                # Replace setup:actpass or setup:passive with setup:active
++                sdp_lines = description.sdp.split('\r\n')
++                modified = False
++                for i, line in enumerate(sdp_lines):
++                    if line.startswith('a=setup:') and not line.startswith('a=setup:active'):
++                        sdp_lines[i] = 'a=setup:active'
++                        modified = True
++                if modified:
++                    description = RTCSessionDescription(
++                        type=description.type,
++                        sdp='\r\n'.join(sdp_lines)
++                    )
++                    print(f"[SDP_PATCH] DTLS setup changed: {original_setup} -> a=setup:active")
++                else:
++                    print(f"[SDP_PATCH] DTLS setup already correct: {original_setup}")
++                setups_after = re.findall(r"^a=setup:.*$", description.sdp, flags=re.M)
++                print(f"[SDP_SETUP] setLocalDescription(after patch) type={description.type} setups={setups_after}")
++            
+             await self._pc.setLocalDescription(description)
+ 
+         elif request.method == "handler.setRemoteDescription":
+@@ -173,6 +208,9 @@
+                 raise TypeError("request data not a RTCSessionDescription")
+ 
+             description = RTCSessionDescription(**data)
++            if description.sdp:
++                setups = re.findall(r"^a=setup:.*$", description.sdp, flags=re.M)
++                print(f"[SDP_SETUP] setRemoteDescription type={description.type} setups={setups}")
+             await self._pc.setRemoteDescription(description)
+ 
+         elif request.method == "handler.getSendMid":
+@@ -351,9 +389,15 @@
+ 
+             # store datachannel in the dictionary
+             self._dataChannels[dataChannelId] = dataChannel
++            Logger.warning(
++                f"ai: handler.createDataChannel stored dcId={dataChannelId} "
++                f"label={label} readyState={dataChannel.readyState} "
++                f"totalDCs={len(self._dataChannels)}"
++            )
+ 
+             @dataChannel.on("open")  # type: ignore
+             async def on_open() -> None:
++                Logger.warning(f"ai: DataChannel OPEN dcId={dataChannelId} label={label}")
+                 await self._channel.notify(dataChannelId, "open")
+ 
+             @dataChannel.on("closing")  # type: ignore
+--- package/lib/Worker.js	1985-10-26 17:15:00.000000000 +0900
++++ package/lib/Worker.js	2026-02-11 13:50:18.907236135 +0900
+@@ -137,15 +137,29 @@
+             this.#child.stdout.on('data', buffer => {
+                 for (const line of buffer.toString('utf8').split('\n')) {
+                     if (line) {
+-                        logger.debug(`(stdout) ${line}`);
++                        // IMPORTANT: do not use the library debug logger here because it is gated
++                        // by the DEBUG env var, and we need Python worker output visible during
++                        // DTLS/ICE debugging.
++                        /* eslint-disable no-console */
++                        console.info(`[aiortc stdout] ${line}`);
++                        /* eslint-enable no-console */
+                     }
+                 }
+             });
+             // In case of a worker bug, mediasoup will log to stderr.
++            // Also intercept __AI_DET__: prefixed lines for AI detection forwarding.
+             this.#child.stderr.on('data', buffer => {
+                 for (const line of buffer.toString('utf8').split('\n')) {
+                     if (line) {
+-                        logger.error(`(stderr) ${line}`);
++                        if (line.startsWith('__AI_DET__:')) {
++                            // Emit AI detection JSON to listeners (e.g. supervisor)
++                            this.safeEmit('aiDetection', line.substring(11));
++                        }
++                        else {
++                            /* eslint-disable no-console */
++                            console.error(`[aiortc stderr] ${line}`);
++                            /* eslint-enable no-console */
++                        }
+                     }
+                 }
+             });

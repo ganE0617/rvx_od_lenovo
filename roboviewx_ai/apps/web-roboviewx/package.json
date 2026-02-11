@@ -1,0 +1,32 @@
+{
+    "name": "web-roboviewx",
+    "version": "0.1.0",
+    "scripts": {
+        "dev": "vite",
+        "build": "tsc && vite build",
+        "preview": "vite preview",
+        "test": "vitest"
+    },
+    "dependencies": {
+        "@repo/types": "file:../../packages/types",
+        "lodash": "^4.17.23",
+        "mediasoup-client": "^3.7.0",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "socket.io-client": "^4.7.2"
+    },
+    "devDependencies": {
+        "@testing-library/jest-dom": "^6.1.5",
+        "@testing-library/react": "^14.1.2",
+        "@types/lodash": "^4.17.23",
+        "@types/react": "^18.2.43",
+        "@types/react-dom": "^18.2.17",
+        "@vitejs/plugin-react": "^4.2.1",
+        "autoprefixer": "^10.4.16",
+        "postcss": "^8.4.32",
+        "tailwindcss": "^3.4.0",
+        "typescript": "^5.2.2",
+        "vite": "^5.0.0",
+        "vitest": "^1.0.0"
+    }
+}

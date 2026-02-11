@@ -1,0 +1,6 @@
+packages:
+  - apps/*
+  - packages/*
+
+patchedDependencies:
+  mediasoup-client-aiortc@3.14.7: patches/mediasoup-client-aiortc@3.14.7.patch
